@@ -1,2 +1,160 @@
 # Evaluating-flight-landing-performance-by-incorporating-pilot-behaviors-involved-multimodal-data-
 Final Yer project of HK Polytechnic univeristy students
+#import the libraries
+import os
+import glob
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+#file_location_(QAR_DATA)
+data_folder = "/Users/dinahang/Desktop/AAE25_FYP Subject_DATA/QAR_DATA"
+scenario_keywords = ['vcrosswind', 'clear', 'lowvis_day', 'lowvis_night', 'crosswind']
+
+# Extraction/reading data
+records = []
+
+for fpath in glob.glob(os.path.join(data_folder, "*.csv")):
+    try:
+        df = pd.read_csv(fpath)
+    except Exception as e:
+        print(f"Error reading {fpath}: {e}")
+        continue
+
+    fname = os.path.basename(fpath)
+    # Scenario extraction based of filename
+    scenario = next((k for k in scenario_keywords if k in fname.lower()), "unknown")
+
+    # Autopilot disengage (Find row where autopilot==1 changes to 0)
+    if 'autopilot' not in df.columns or 'onGround' not in df.columns:
+        print(f"Missing autopilot or onGround in {fname}")
+        continue
+
+    ap_off_idx = df[(df['autopilot'] == 0) & (df['autopilot'].shift(1) == 1)].index
+    if len(ap_off_idx) == 0:
+        ap_off_idx = df[df['autopilot'] == 0].index.min()
+    else:
+        ap_off_idx = ap_off_idx[0]
+    if pd.isna(ap_off_idx):
+        continue
+
+    #Touchdown point (first onGround==1 inrelation to autopilot==1)
+    touchdown_idx = df[(df.index > ap_off_idx) & (df['onGround'] == 1)].index.min()
+    if pd.isna(touchdown_idx):
+        continue
+
+    # Extract all variables at touchdown
+    row = df.loc[touchdown_idx]
+    # All columns except time and position
+    exclude_cols = ['acType', 'realWorldTime', 'acLAT', 'acLON', 'hourZ', 'minZ', 'secZ', 'dayZ', 'monthZ', 'yearZ']
+    features = {col: row[col] for col in df.columns if col not in exclude_cols}
+    features['file'] = fname
+    features['scenario'] = scenario
+
+    # Add time since AP off to touchdown
+    features['seconds_since_ap_off'] = touchdown_idx - ap_off_idx
+
+    # Label : hard landing if vs <= -700 fpm at touchdown
+    features['landing_type'] = 'hard' if row['vs'] <= -700 else 'soft'
+    features['label'] = 1 if row['vs'] <= -700 else 0
+
+    records.append(features)
+
+#DATAFRAME 
+df_all = pd.DataFrame(records)
+print("Extracted records:", len(df_all))
+
+# Categorize as 'hard' or 'standard' if ROD> -700 fpm as per 3 degree standard rule!
+df_all['landing_category'] = np.where(df_all['vs'] <= -700, 'hard', 'standard')
+
+#VISUALIZATION:
+
+#1. Scenario breakdown y landing count and type!
+if 'scenario' in df_all.columns:
+    plt.figure(figsize=(8,4))
+    sns.countplot(data=df_all, x='scenario', hue='landing_type')
+    plt.title("Landing Type by Scenario")
+    plt.tight_layout(); plt.show()
+
+
+#2.Top-8: corr with Accleration Vertical yaxis(accVERTy) (pick features, then scatter/reg) 
+if 'accVERTy' in corr.columns:
+    ranked = corr['accVERTy'].drop('accVERTy').abs().sort_values(ascending=False)
+    top_features = ranked.head(8).index.tolist()
+else:
+    top_features = []
+
+n = len(top_features)
+cols = 4
+rows = (n + cols - 1) // cols if n else 0
+
+if n:
+    fig, axes = plt.subplots(rows, cols, figsize=(4*cols+2, 4*rows+1))
+    axes = np.array(axes).reshape(rows, cols)
+    for i, v in enumerate(top_features):
+        r, c = divmod(i, cols)
+        ax = axes[r, c]
+        sub = df_all[[v, 'accVERTy', 'landing_type']].dropna()
+        if sub.empty:
+            ax.set_axis_off(); continue
+        sns.regplot(data=sub, x=v, y='accVERTy', scatter_kws={'alpha':0.6, 's':35}, line_kws={'color':'black'}, ax=ax)
+#overlay label coloring:
+        sns.scatterplot(data=sub, x=v, y='accVERTy', hue='landing_type', palette={'soft':'tab:blue','hard':'tab:red'},
+                        legend=False, ax=ax, s=50, alpha=0.5)
+        ax.set_title(f"accVERTy vs {v}")
+#turn off any extra axes
+    for j in range(i+1, rows*cols):
+        r, c = divmod(j, cols)
+        axes[r, c].set_axis_off()
+    plt.tight_layout()
+    plt.show()
+
+#3.Pilot inputs vs meterological conditions per landing type (boxplots in a grid)
+pilot_inputs = ['elevatorIndicator', 'aileronIndicator', 'rudderIndicator', 'eng1ThrLever', 'eng2ThrLever']
+weather_vars = ['windSpd', 'windDir', 'staticAmbientTempSAT']
+vars_to_plot = [v for v in pilot_inputs + weather_vars if v in df_all.columns]
+
+cols = 3
+rows = (len(vars_to_plot) + cols - 1) // cols if vars_to_plot else 0
+
+if vars_to_plot:
+    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
+    axes = np.array(axes).reshape(rows, cols)
+    for i, v in enumerate(vars_to_plot):
+        r, c = divmod(i, cols)
+        ax = axes[r, c]
+        sns.boxplot(data=df_all, x='landing_type', y=v, ax=ax)
+        sns.stripplot(data=df_all, x='landing_type', y=v, color='k', alpha=0.4, ax=ax)
+        ax.set_title(f"{v} by Landing Type")
+    for j in range(i+1, rows*cols):
+        r, c = divmod(j, cols)
+        axes[r, c].set_axis_off()
+    plt.tight_layout()
+    plt.show()
+
+#4. Distributions: accVERTy v.s Vertical Speed 
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+sns.histplot(df_all, x='accVERTy', hue='landing_type', kde=True, ax=axes[0])
+axes[0].set_title("Vertical Acceleration at Touchdown")
+sns.histplot(df_all, x='vs', hue='landing_type', kde=True, ax=axes[1])
+axes[1].set_title("Vertical Speed at Touchdown")
+plt.tight_layout(); plt.show()
+
+# 5.Correlation heatmap 
+num = df_all.select_dtypes(include=[np.number])
+corr = num.corr()
+
+plt.figure(figsize=(18, 14))
+ax = sns.heatmap(
+    corr, cmap="coolwarm", vmin=-1, vmax=1, center=0, annot=True, fmt=".2f",
+    linewidths=0.3, linecolor="white", square=False, cbar_kws={"shrink":0.8, "pad":0.02},
+    annot_kws={"size":7}
+)
+ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+plt.title("Correlation Matrix (Original Touchdown Variables)")
+plt.tight_layout()
+plt.show()
+
+
