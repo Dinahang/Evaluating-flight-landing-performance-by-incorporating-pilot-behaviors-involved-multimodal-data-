@@ -1,0 +1,703 @@
+                                # KEEP AT TOP! FIX FOR THE LOCALE ERROR 
+os.environ['LANG'] = 'en_US.UTF-8'
+os.environ['LC_ALL'] = 'en_US.UTF-8'
+                                        
+                                        #SETUP:
+from typing import Optional, Dict, Any, List, Tuple
+import os
+import glob
+import math
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestRegressor, IsolationForest
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+from sklearn.inspection import permutation_importance
+from sklearn.neighbors import NearestNeighbors
+from sklearn.linear_model import LinearRegression
+
+warnings.filterwarnings("ignore", category=UserWarning)
+pd.set_option("display.width", 200)
+pd.set_option("display.max_columns", 200)
+
+
+#Read 1 CSV(in the csv folder) per landing, remove duplicates, force numbers, commonize timestamps (with fallbacks)
+
+DATA_FOLDER = "/Users/dinahang/Desktop/AAE25_FYP Subject_DATA/QAR_DATA"
+
+                                            #Scenario_identification
+SCENARIO_KEYWORDS = ['vcrosswind', 'clear', 'lowvis_day', 'lowvis_night', 'crosswind']
+
+                                    #Apply QAR Conventions
+#Normalize controls (aileron/elevator/rudder → [-1,1]).
+##From Leo's file, convert bank to degrees if raw (* 360/(65536²); – right / + left).
+##Keep IAS in knots; standardize pitch, AoA columns.
+
+                                # Runway / Environment
+RUNWAY_TRUE_HEADING_DEG = 73.0     # true bearing
+RUNWAY_ELEVATION_FT = 28.0         # MSL
+QNH_HPA = 1022.0                   # constant for all scenarios 
+HPA_TO_FEET = 27.0                 # low-altitude approx (1 hPa ~ 27 ft)
+
+# Windowing and thresholds
+N_SECONDS_BEFORE_TD = 20.0
+FALLBACK_DT_SECONDS = 1.0
+HARD_LANDING_FPM_THRESHOLD = -180.0
+
+# Controls normalization constants from LEO's:
+CTRL_MAX_ABS = 16383.0
+
+
+                                        # COLUMN CANDIDATES
+
+THROTTLE_CANDIDATES = [
+    "throttle", "throttleCmd", "throttleLever", "thrLever", "thr", "thrustLevers",
+    "throttle1", "throttle2", "thrLever1", "thrLever2"
+]
+AOA_CANDIDATES = ["angleOfAttackAOA", "aoa", "angleOfAttack", "alpha"]
+BARO_ALT_CANDIDATES = ["alt_baro", "altBaro", "baroAlt", "alt_baro_feet", "alt_baro_ft", "pressureAlt", "pressAlt"]
+BANK_CANDIDATES = ["bank", "bank_raw", "bankDeg", "roll", "rollDeg", "roll_raw"]
+PITCH_CANDIDATES = ["pit", "pitch", "pitchDeg", "pitch_raw"]
+
+
+# UTILITIES
+
+def scenario_from_name(fname: str, keywords: List[str]) -> str:
+    name = fname.lower()
+    for k in keywords:
+        if k in name:
+            return k
+    return "unclassified_scenario"
+
+def parse_timestamp_col(df: pd.DataFrame) -> pd.Series:
+    """
+    Robust timestamp parsing:
+    1) 'realWorldTime' as '%Y%m%d_%H%M%S'
+    2) 'yearZ','monthZ','dayZ','hourZ','minZ','secZ'
+    3) otherwise NaT
+    """
+    if 'realWorldTime' in df.columns:
+        ts = pd.to_datetime(df['realWorldTime'], format="%Y%m%d_%H%M%S", errors="coerce")
+        if ts.notna().any():
+            return ts
+
+    needed = {'hourZ', 'minZ', 'secZ', 'dayZ', 'monthZ', 'yearZ'}
+    if needed.issubset(df.columns):
+        return pd.to_datetime(df[['yearZ', 'monthZ', 'dayZ', 'hourZ', 'minZ', 'secZ']].rename(
+            columns={'yearZ': 'year', 'monthZ': 'month', 'dayZ': 'day',
+                     'hourZ': 'hour', 'minZ': 'minute', 'secZ': 'second'}), errors="coerce")
+    return pd.Series(pd.NaT, index=df.index)
+
+def wrap_deg_to_180(x: float) -> float:
+    return (x + 180.0) % 360.0 - 180.0
+
+def wind_components_true(wind_spd_kt: float, wind_dir_true_deg_from: float, ref_bearing_true_deg: float) -> Tuple[float, float]:
+    """
+    Returns (headwind_kt, crosswind_kt). Positive headwind = headwind, negative = tailwind.
+    Positive crosswind = wind from the right (blowing to the left).
+    """
+    if pd.isna(wind_spd_kt) or pd.isna(wind_dir_true_deg_from):
+        return (np.nan, np.nan)
+    rel = math.radians(wrap_deg_to_180(wind_dir_true_deg_from - ref_bearing_true_deg))
+    head = wind_spd_kt * math.cos(rel)
+    cross = wind_spd_kt * math.sin(rel)
+    return head, cross
+
+def coerce_numeric_cols(df: pd.DataFrame, exclude: List[str] = None) -> pd.DataFrame:
+    exclude = set(exclude or [])
+    for c in df.columns:
+        if c not in exclude:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df
+
+def choose_first_present(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def detect_throttle_cols(df: pd.DataFrame) -> List[str]:
+    found = []
+    for col in THROTTLE_CANDIDATES:
+        if col in df.columns:
+            found.append(col)
+    for c in df.columns:
+        if any(s in c.lower() for s in ["thr", "throttle"]) and c not in found:
+            found.append(c)
+    return found
+
+def is_bank_raw_series(series: pd.Series) -> bool:
+    """Heuristic: if |bank| > 180 or int with large magnitudes, treat as raw."""
+    if series.dropna().empty:
+        return False
+    max_abs = series.abs().max()
+    if max_abs > 180.0:
+        return True
+    if pd.api.types.is_integer_dtype(series.dropna()):
+        return True
+    return False
+
+def apply_qar_conventions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Implement QAR conventions:
+      - Control inputs [–16383..+16383]: normalize to [-1, 1]
+      - Bank degrees if raw: bank_deg = raw*360/(65536^2) (– right / + left)
+      - IAS in knots (ensure numeric)
+      - Pitch: if 'pit' (nose-down +), invert so nose-up is positive
+      - AoA unify (deg)
+    """
+    # Normalize controls
+    if 'aileronIndicator' in df.columns:
+        df['aileron_norm'] = df['aileronIndicator'] / CTRL_MAX_ABS
+    if 'elevatorIndicator' in df.columns:
+        df['elevator_norm'] = df['elevatorIndicator'] / CTRL_MAX_ABS
+    if 'rudderIndicator' in df.columns:
+        df['rudder_norm'] = df['rudderIndicator'] / CTRL_MAX_ABS
+
+    # IAS ensure numeric (knots)
+    if 'ias' in df.columns:
+        df['ias'] = pd.to_numeric(df['ias'], errors='coerce')
+
+    # Bank
+    bank_col = choose_first_present(df, BANK_CANDIDATES)
+    if bank_col:
+        s = pd.to_numeric(df[bank_col], errors='coerce')
+        if is_bank_raw_series(s):
+            df['bank_deg'] = s * (360.0 / (65536.0 ** 2))
+        else:
+            df['bank_deg'] = s.astype(float)
+    else:
+        df['bank_deg'] = np.nan
+
+    # Pitch (nose-up positive)
+    pitch_col = choose_first_present(df, PITCH_CANDIDATES)
+    if pitch_col:
+        df['pitch_deg'] = -pd.to_numeric(df[pitch_col], errors='coerce') if pitch_col == "pit" else pd.to_numeric(df[pitch_col], errors='coerce')
+    else:
+        df['pitch_deg'] = np.nan
+
+    # AoA
+    aoa_col = choose_first_present(df, AOA_CANDIDATES)
+    df['aoa_deg'] = pd.to_numeric(df[aoa_col], errors='coerce') if aoa_col else np.nan
+
+    return df
+
+def estimate_dt_seconds(ts: pd.Series) -> float:
+    if ts.isna().all():
+        return FALLBACK_DT_SECONDS
+    diffs = ts.diff().dt.total_seconds()
+    med = np.nanmedian(diffs)
+    if np.isnan(med) or med <= 0:
+        return FALLBACK_DT_SECONDS
+    return float(med)
+
+def construct_alt_agl_fallback(df: pd.DataFrame, td_idx: Optional[int] = None) -> pd.Series:
+    """
+    Build AGL altitude:
+     1) 'alt_radio'
+     2) Else derive AGL from baro to MSL, then AGL = MSL - runway elevation.
+        - If 'baro' looks like pressure altitude, adjust to MSL using QNH:
+          alt_msl ≈ pressure_alt_ft - (QNH - 1013.25) * 27 ft
+     3) Finally align TD (if known) to 0 ft AGL for robustness to biases.
+    """
+    # 1) radio_alt!
+    if 'alt_radio' in df.columns and df['alt_radio'].notna().sum() > 0:
+        alt_agl = pd.to_numeric(df['alt_radio'], errors='coerce')
+    else:
+        # 2) Use baro-based approach
+        baro_col = choose_first_present(df, BARO_ALT_CANDIDATES)
+        if baro_col:
+            baro = pd.to_numeric(df[baro_col], errors='coerce').copy()
+            # Heuristic: if aircraft on-ground samples cluster near runway elevation with QNH applied,
+            # treat this as MSL already. Otherwise treat as pressure altitude and adjust.
+            #  QNH correction : alt_msl = baro - (QNH-1013.25)*27
+            qnh_correction_ft = (QNH_HPA - 1013.25) * HPA_TO_FEET
+            alt_msl = baro - qnh_correction_ft  # assuming 'baro' ~ pressure altitude if not already MSL
+            alt_agl = alt_msl - RUNWAY_ELEVATION_FT
+        else:
+            return pd.Series(np.nan, index=df.index)
+
+    # 3) Align TD index to AGL=0 if available; else set local min to 0
+    if td_idx is not None and td_idx >= 0 and td_idx < len(alt_agl) and pd.notna(alt_agl.iloc[td_idx]):
+        return alt_agl - alt_agl.iloc[td_idx]
+    else:
+        return alt_agl - alt_agl.min(skipna=True)
+
+def find_touchdown_index(df: pd.DataFrame, alt_agl: pd.Series) -> Optional[int]:
+    """
+    TD detection priority:
+      1) first transition onGround 0 -> 1
+      2) minimum AGL (if min < 10 ft)
+    """
+    if 'onGround' in df.columns:
+        og = pd.to_numeric(df['onGround'], errors='coerce').fillna(0).astype(int)
+        trans = np.where((og.shift(1, fill_value=0) == 0) & (og == 1))[0]
+        if len(trans) > 0:
+            return int(trans[0])
+
+    if alt_agl.notna().sum() > 0 and alt_agl.min() < 10:
+        return int(alt_agl.idxmin())
+
+    return None
+
+def slope_over_window(x: pd.Series, y: pd.Series) -> float:
+    """Simple linear slope dy/dx over a window; returns NaN if insufficient."""
+    try:
+        xv = x.values.astype(float)
+        yv = y.values.astype(float)
+        if len(xv) < 2 or np.any(np.isnan(xv)) or np.any(np.isnan(yv)):
+            return np.nan
+        A = np.vstack([xv, np.ones_like(xv)]).T
+        m, _ = np.linalg.lstsq(A, yv, rcond=None)[0]
+        return float(m)
+    except Exception:
+        return np.nan
+
+
+# PER-FILE PROCESSING
+
+def process_file(fpath: str) -> Optional[Dict[str, Any]]:
+    try:
+        df = pd.read_csv(fpath, low_memory=False)
+    except Exception as e:
+        print(f"[WARN] Skipping {fpath}: {e}")
+        return None
+
+    fname = os.path.basename(fpath)
+    scenario = scenario_from_name(fname, SCENARIO_KEYWORDS)
+    df = df.drop_duplicates().reset_index(drop=True)
+
+    # Validate minimal columns
+    required_any = ['onGround', 'vs', 'accVERTy', 'ias']  # alt handled via fallback
+    if not all(c in df.columns for c in required_any):
+        print(f"[WARN] Missing required columns in {fname}")
+        return None
+
+    # Numerics & timestamps
+    df = coerce_numeric_cols(df, exclude=['realWorldTime', 'scenario'])
+    df['timestamp'] = parse_timestamp_col(df)
+
+    # QAR conventions
+    df = apply_qar_conventions(df)
+
+    # Wind (if present)
+    if 'windSpd' in df.columns and 'windDir' in df.columns:
+        tuples = df.apply(lambda r: wind_components_true(r.get('windSpd', np.nan),
+                                                        r.get('windDir', np.nan),
+                                                        RUNWAY_TRUE_HEADING_DEG), axis=1)
+        df['headwind_kt'] = [t[0] for t in tuples]
+        df['crosswind_kt'] = [t[1] for t in tuples]
+
+    # First AGL estimate (TD unknown)
+    alt_agl_initial = construct_alt_agl_fallback(df, td_idx=None)
+
+    # TD detection
+    td_idx = find_touchdown_index(df, alt_agl_initial)
+    if td_idx is None:
+        # Fallback: try aligning AGL to min and re-check
+        td_idx = find_touchdown_index(df, alt_agl_initial - alt_agl_initial.min(skipna=True))
+    if td_idx is None:
+        print(f"[WARN] Could not determine touchdown in {fname}")
+        return None
+
+    # Final AGL aligned to TD = 0
+    alt_agl = construct_alt_agl_fallback(df, td_idx=td_idx)
+    df['alt_agl_ft'] = alt_agl
+
+    # Windowing
+    dt = estimate_dt_seconds(df['timestamp'])
+    rows_pre = int(max(1, round(N_SECONDS_BEFORE_TD / dt)))
+    idx_pre = max(0, td_idx - rows_pre)
+    seg = df.iloc[idx_pre: td_idx + 1].copy()
+
+    # Build time (seconds) for slopes
+    if df['timestamp'].isna().all():
+        df['_tsec'] = np.arange(len(df)) * dt
+        seg['_tsec'] = np.arange(len(seg)) * dt
+    else:
+        t0 = df['timestamp'].iloc[idx_pre]
+        df['_tsec'] = (df['timestamp'] - df['timestamp'].iloc[0]).dt.total_seconds()
+        seg['_tsec'] = (seg['timestamp'] - t0).dt.total_seconds()
+
+    # Targets
+    vs_td = df.at[td_idx, 'vs'] if 'vs' in df.columns else np.nan
+    g_td = df.at[td_idx, 'accVERTy'] if 'accVERTy' in df.columns else np.nan
+
+    # Focus values at TD
+    feats_at_td = {
+        'ias_td': df.at[td_idx, 'ias'] if 'ias' in df.columns else np.nan,
+        'bank_td_deg': df.at[td_idx, 'bank_deg'] if 'bank_deg' in df.columns else np.nan,
+        'pitch_td_deg': df.at[td_idx, 'pitch_deg'] if 'pitch_deg' in df.columns else np.nan,
+        'aoa_td_deg': df.at[td_idx, 'aoa_deg'] if 'aoa_deg' in df.columns else np.nan,
+        'alt_td_agl_ft': df.at[td_idx, 'alt_agl_ft'] if 'alt_agl_ft' in df.columns else np.nan,
+        'aileron_td': df.at[td_idx, 'aileron_norm'] if 'aileron_norm' in df.columns else np.nan,
+        'elevator_td': df.at[td_idx, 'elevator_norm'] if 'elevator_norm' in df.columns else np.nan,
+        'rudder_td': df.at[td_idx, 'rudder_norm'] if 'rudder_norm' in df.columns else np.nan,
+        'headwind_td': df.at[td_idx, 'headwind_kt'] if 'headwind_kt' in df.columns else np.nan,
+        'crosswind_td': df.at[td_idx, 'crosswind_kt'] if 'crosswind_kt' in df.columns else np.nan,
+    }
+
+    # Segment series
+    def get_seg(name): return seg[name] if name in seg.columns else pd.Series(np.nan, index=seg.index)
+    seg_vs = get_seg('vs'); seg_ias = get_seg('ias'); seg_bank = get_seg('bank_deg')
+    seg_pitch = get_seg('pitch_deg'); seg_aoa = get_seg('aoa_deg'); seg_alt = get_seg('alt_agl_ft')
+    seg_ail = get_seg('aileron_norm'); seg_ele = get_seg('elevator_norm'); seg_rud = get_seg('rudder_norm')
+    seg_t = seg['_tsec']
+
+    # Throttle
+    throttle_cols = detect_throttle_cols(seg)
+    seg['throttle_mean'] = seg[throttle_cols].mean(axis=1) if throttle_cols else np.nan
+
+    # Helpers
+    def agg_stats(s: pd.Series, prefix: str) -> Dict[str, float]:
+        return {
+            f'{prefix}_mean': s.mean(skipna=True),
+            f'{prefix}_std': s.std(skipna=True),
+            f'{prefix}_max': s.max(skipna=True),
+            f'{prefix}_min': s.min(skipna=True),
+            f'{prefix}_p10': s.quantile(0.10) if s.notna().sum() else np.nan,
+            f'{prefix}_p90': s.quantile(0.90) if s.notna().sum() else np.nan,
+            f'{prefix}_range': (s.max(skipna=True) - s.min(skipna=True)) if s.notna().sum() else np.nan
+        }
+
+    features = {
+        'file': fname,
+        'scenario': scenario,
+        'vs_td_target': vs_td,
+        'g_td_target': g_td,
+        **feats_at_td,
+        # Slopes
+        'slope_vs': slope_over_window(seg_t, seg_vs),
+        'slope_ias': slope_over_window(seg_t, seg_ias),
+        'slope_alt': slope_over_window(seg_t, seg_alt),
+        'slope_bank': slope_over_window(seg_t, seg_bank),
+        'slope_pitch': slope_over_window(seg_t, seg_pitch),
+        'slope_aoa': slope_over_window(seg_t, seg_aoa),
+        'slope_ail': slope_over_window(seg_t, seg_ail),
+        'slope_ele': slope_over_window(seg_t, seg_ele),
+        'slope_rud': slope_over_window(seg_t, seg_rud),
+        'throttle_mean_td': seg['throttle_mean'].iloc[-1] if len(seg) else np.nan,
+        # Stability aggregates
+        **agg_stats(seg_vs, 'vs_approach'),
+        **agg_stats(seg_ias, 'ias_approach'),
+        **agg_stats(seg_bank.abs(), 'bankAbs_approach'),
+        **agg_stats(seg_pitch, 'pitch_approach'),
+        **agg_stats(seg_aoa, 'aoa_approach'),
+        **agg_stats(seg_alt, 'alt_agl_approach'),
+        **agg_stats(seg_ail, 'aileron_approach'),
+        **agg_stats(seg_ele, 'elevator_approach'),
+        **agg_stats(seg_rud, 'rudder_approach'),
+        **agg_stats(seg['throttle_mean'], 'throttle_approach')
+    }
+
+    # 5-second descent rate near TD
+    steps_5s = int(round(5.0 / max(estimate_dt_seconds(df['timestamp']), 1e-6)))
+    idx_5s = max(0, td_idx - steps_5s)
+    if 'alt_agl_ft' in df.columns and df['alt_agl_ft'].notna().sum():
+        features['alt_rate_final_5s'] = (df.at[td_idx, 'alt_agl_ft'] - df.at[idx_5s, 'alt_agl_ft']) / 5.0
+    else:
+        features['alt_rate_final_5s'] = np.nan
+
+    features['hard_landing_flag'] = 1 if (pd.notna(vs_td) and vs_td <= HARD_LANDING_FPM_THRESHOLD) else 0
+
+    return features
+
+
+                                            # SUMMARY
+    
+#Global: Permutation importance (which features matter most).
+#Per‑landing (on request): SHAP explanations or local linear surrogate if SHAP unavailable.
+
+def global_permutation_report(model, X_test, y_test, feat_names, title: str, n_repeats: int = 10):
+    """Global permutation importance on the test split + plot."""
+    result = permutation_importance(model, X_test, y_test, n_repeats=n_repeats, random_state=42, n_jobs=-1)
+    importances = pd.Series(result.importances_mean, index=feat_names).sort_values()
+    plt.figure(figsize=(10, 6))
+    importances.tail(15).plot(kind='barh')
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+    return importances
+
+def local_shap_or_surrogate(model, X_all: pd.DataFrame, feat_names: List[str], row_idx: int):
+    """
+    Try SHAP TreeExplainer for a single row.
+    If SHAP unavailable, use a local linear surrogate built on k-NN neighborhood.
+    """
+    x_row = X_all.iloc[[row_idx]]
+    explanation = {}
+
+    #SHAP
+    try:
+        import shap
+        explainer = shap.TreeExplainer(model)
+        shap_vals = explainer.shap_values(X_all, check_additivity=False)
+        # shap_values can be list for multi-output or class-based; ensure array
+        if isinstance(shap_vals, list):
+            shap_vals = shap_vals[0]
+        row_shap = pd.Series(shap_vals[row_idx], index=feat_names).sort_values(key=np.abs, ascending=False)
+        explanation['method'] = 'SHAP'
+        explanation['values'] = row_shap
+
+        # Waterfall / bar
+        try:
+            shap.plots.waterfall(shap.Explanation(values=shap_vals[row_idx],
+                                                  base_values=explainer.expected_value,
+                                                  data=X_all.iloc[row_idx].values,
+                                                  feature_names=feat_names))
+            plt.show()
+        except Exception:
+            # fallback bar plot
+            row_shap.head(15).plot(kind='barh', figsize=(8, 6))
+            plt.title("Top Local SHAP Attributions")
+            plt.tight_layout()
+            plt.show()
+
+        return explanation
+    except Exception as e:
+        # Local linear surrogate using k-NN
+        k = min(50, max(10, int(0.2 * len(X_all))))
+        nbrs = NearestNeighbors(n_neighbors=k, metric='euclidean')
+        nbrs.fit(X_all.values)
+        distances, indices = nbrs.kneighbors(x_row.values)
+        X_local = X_all.iloc[indices[0]]
+        # For regression, we need corresponding target; we will use model predictions as pseudo-target
+        y_local = model.predict(X_local.values)
+        lin = LinearRegression()
+        lin.fit(X_local.values, y_local)
+        coefs = pd.Series(lin.coef_, index=feat_names).sort_values(key=np.abs, ascending=False)
+
+        explanation['method'] = 'Local linear surrogate (k-NN)'
+        explanation['values'] = coefs
+
+        coefs.head(15).plot(kind='barh', figsize=(8, 6), color='tab:purple')
+        plt.title("Top Local Surrogate Coefficients")
+        plt.tight_layout()
+        plt.show()
+        return explanation
+
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
+def main():
+    files = glob.glob(os.path.join(DATA_FOLDER, "*.csv"))
+    if not files:
+        print(f"No CSV files found in {DATA_FOLDER}")
+        return
+
+    # Process all landings
+    records = [process_file(f) for f in files]
+    df_all = pd.DataFrame([r for r in records if r is not None])
+
+    if df_all.empty:
+        print("No valid landing data found.")
+        return
+
+    # Save engineered features
+    out_raw = os.path.join(DATA_FOLDER, "processed_landings_raw.csv")
+    df_all.to_csv(out_raw, index=False)
+    print(f"[INFO] Saved raw engineered features to {out_raw}")
+
+    # Prepare ML data
+    target_vs = 'vs_td_target'
+    target_g = 'g_td_target'
+    non_features = ['file', 'scenario', target_vs, target_g]
+
+    feature_cols = [c for c in df_all.columns if c not in non_features]
+    X = df_all[feature_cols].copy()
+    y_vs = df_all[target_vs].copy()
+    y_g = df_all[target_g].copy()
+
+    # Impute
+    imputer = SimpleImputer(strategy='median')
+    X_filled = imputer.fit_transform(X)
+
+    
+    # GLOBAL MODELS
+    
+    X_train, X_test, y_train_vs, y_test_vs = train_test_split(X_filled, y_vs, test_size=0.2, random_state=42)
+    model_vs = RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1)
+    model_vs.fit(X_train, y_train_vs)
+    preds_vs = model_vs.predict(X_test)
+
+    print("\n[GLOBAL VS MODEL]")
+    print(f"R^2:  {r2_score(y_test_vs, preds_vs):.4f}")
+    print(f"MAE:  {mean_absolute_error(y_test_vs, preds_vs):.2f} fpm")
+    print(f"RMSE: {mean_squared_error(y_test_vs, preds_vs, squared=False):.2f} fpm")
+
+    # G model
+    X_train_g, X_test_g, y_train_g, y_test_g = train_test_split(X_filled, y_g, test_size=0.2, random_state=42)
+    model_g = RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1)
+    model_g.fit(X_train_g, y_train_g)
+    preds_g = model_g.predict(X_test_g)
+
+    print("\n[GLOBAL G MODEL]")
+    print(f"R^2:  {r2_score(y_test_g, preds_g):.4f}")
+    print(f"MAE:  {mean_absolute_error(y_test_g, preds_g):.4f} g")
+    print(f"RMSE: {mean_squared_error(y_test_g, preds_g, squared=False):.4f} g")
+
+    
+    # ANOMALY DETECTION
+    
+    iso = IsolationForest(contamination=0.10, random_state=42)
+    df_all['anomaly_label'] = iso.fit_predict(X_filled)  # -1 anomaly
+
+    
+    # GLOBAL EXPLAINABILITY (Permutation)
+  
+    try:
+        global_permutation_report(model_vs, X_test, y_test_vs, feature_cols, "Global Permutation Importance (VS)")
+        global_permutation_report(model_g, X_test_g, y_test_g, feature_cols, "Global Permutation Importance (G)")
+    except Exception as e:
+        print(f"[WARN] Global permutation importance skipped: {e}")
+
+    
+    # PER-SCENARIO MODELING / EVALUATION
+    
+    scenario_metrics = []
+    for scen, df_s in df_all.groupby('scenario'):
+        if len(df_s) < 12:
+            continue  # skip tiny samples to avoid unstable splits
+        Xs = df_s[feature_cols]
+        ys_vs = df_s[target_vs]
+        ys_g = df_s[target_g]
+
+        Xs_filled = imputer.fit_transform(Xs)
+
+        # VS
+        Xtr, Xte, ytr, yte = train_test_split(Xs_filled, ys_vs, test_size=0.2, random_state=42)
+        m_vs = RandomForestRegressor(n_estimators=400, random_state=42, n_jobs=-1)
+        m_vs.fit(Xtr, ytr)
+        p_vs = m_vs.predict(Xte)
+
+        # G
+        Xtrg, Xteg, ytrg, yteg = train_test_split(Xs_filled, ys_g, test_size=0.2, random_state=42)
+        m_g = RandomForestRegressor(n_estimators=400, random_state=42, n_jobs=-1)
+        m_g.fit(Xtrg, ytrg)
+        p_g = m_g.predict(Xteg)
+
+        scen_row = {
+            'scenario': scen,
+            'n': len(df_s),
+            'VS_R2': r2_score(yte, p_vs),
+            'VS_MAE_fpm': mean_absolute_error(yte, p_vs),
+            'VS_RMSE_fpm': mean_squared_error(yte, p_vs, squared=False),
+            'G_R2': r2_score(yteg, p_g),
+            'G_MAE_g': mean_absolute_error(yteg, p_g),
+            'G_RMSE_g': mean_squared_error(yteg, p_g, squared=False),
+        }
+        scenario_metrics.append(scen_row)
+
+        # Quick scenario plots
+        try:
+            fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+            ax[0].scatter(yte, p_vs, alpha=0.7, edgecolor='k')
+            ax[0].plot([yte.min(), yte.max()], [yte.min(), yte.max()], 'r--')
+            ax[0].set_title(f"{scen} VS: Predicted vs Actual")
+            ax[0].set_xlabel("Actual VS (fpm)")
+            ax[0].set_ylabel("Predicted VS (fpm)")
+
+            ax[1].scatter(yteg, p_g, alpha=0.7, edgecolor='k', color='tab:green')
+            ax[1].plot([yteg.min(), yteg.max()], [yteg.min(), yteg.max()], 'r--')
+            ax[1].set_title(f"{scen} G: Predicted vs Actual")
+            ax[1].set_xlabel("Actual G")
+            ax[1].set_ylabel("Predicted G")
+
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            print(f"[WARN] Scenario plots skipped for {scen}: {e}")
+
+    if scenario_metrics:
+        df_scen = pd.DataFrame(scenario_metrics)
+        out_scen = os.path.join(DATA_FOLDER, "scenario_metrics.csv")
+        df_scen.to_csv(out_scen, index=False)
+        print(f"[INFO] Per-scenario metrics saved to {out_scen}")
+        print(df_scen.sort_values('scenario'))
+
+    
+    # PRACTICAL EDA (heatmap maybe)
+    
+    try:
+        # 1) Prediction vs Actual (Global)
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        ax[0].scatter(y_test_vs, preds_vs, alpha=0.6, edgecolor='k')
+        lims = [min(y_test_vs.min(), preds_vs.min()), max(y_test_vs.max(), preds_vs.max())]
+        ax[0].plot(lims, lims, 'r--'); ax[0].set_xlim(lims); ax[0].set_ylim(lims)
+        ax[0].set_title("VS: P redicted vs Actual")
+        ax[0].set_xlabel("Actual VS (fpm)"); ax[0].set_ylabel("Predicted VS (fpm)")
+
+        ax[1].scatter(y_test_g, preds_g, alpha=0.6, edgecolor='k', color='tab:green')
+        lims = [min(y_test_g.min(), preds_g.min()), max(y_test_g.max(), preds_g.max())]
+        ax[1].plot(lims, lims, 'r--'); ax[1].set_xlim(lims); ax[1].set_ylim(lims)
+        ax[1].set_title("G: Predicted vs Actual")
+        ax[1].set_xlabel("Actual G"); ax[1].set_ylabel("Predicted G")
+        plt.tight_layout(); plt.show()
+
+        # 2) Error distributions
+        err_vs = preds_vs - y_test_vs.values
+        err_g = preds_g - y_test_g.values
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        sns.histplot(err_vs, bins=30, kde=True, ax=ax[0], color='tab:blue')
+        ax[0].set_title("VS Residuals (Pred - Actual) [fpm]")
+        sns.histplot(err_g, bins=30, kde=True, ax=ax[1], color='tab:orange')
+        ax[1].set_title("G Residuals (Pred - Actual)")
+        plt.tight_layout(); plt.show()
+
+        # 3) Scenario-wise boxplots for targets
+        if 'scenario' in df_all.columns:
+            fig, ax = plt.subplots(1, 2, figsize=(14, 5))
+            sns.boxplot(data=df_all, x='scenario', y='vs_td_target', ax=ax[0])
+            ax[0].set_title("VS by Scenario (Touchdown fpm)"); ax[0].tick_params(axis='x', rotation=30)
+            sns.boxplot(data=df_all, x='scenario', y='g_td_target', ax=ax[1], color='lightgreen')
+            ax[1].set_title("G by Scenario (Touchdown)"); ax[1].tick_params(axis='x', rotation=30)
+            plt.tight_layout(); plt.show()
+
+        # 4) Target vs key drivers (scatter plot)
+        def safe_scatter(xname, y, title, color='tab:blue'):
+            if xname in df_all.columns:
+                plt.figure(figsize=(5.5, 4.5))
+                plt.scatter(df_all[xname], df_all[y], alpha=0.5, edgecolor='k', color=color)
+                plt.xlabel(xname); plt.ylabel(y); plt.title(title)
+                plt.tight_layout(); plt.show()
+        safe_scatter('ias_td', 'vs_td_target', 'VS vs IAS at TD')
+        safe_scatter('headwind_td', 'vs_td_target', 'VS vs Headwind at TD')
+        safe_scatter('bank_td_deg', 'g_td_target', 'G vs |Bank| at TD', color='tab:red')
+
+    except Exception as e:
+        print(f"[WARN] EDA plotting skipped due to: {e}")
+
+    
+    #PER-LANDING EXPLAINABILITY 
+
+    if EXPLAIN_LANDING_FILE is not None:
+        # Find the row for that file
+        mask = df_all['file'].str.lower() == EXPLAIN_LANDING_FILE.lower()
+        if not mask.any():
+            print(f"[WARN] Landing file '{EXPLAIN_LANDING_FILE}' not found in processed data.")
+        else:
+            row_idx = mask.idxmax()  # index of the first True
+            # Explain with respect to VS model by default
+            print(f"\n[EXPLAIN] Per-landing explainability for: {df_all.loc[row_idx, 'file']}")
+            try:
+                # Use the same imputer on full X to get matrix
+                X_all_filled = SimpleImputer(strategy='median').fit_transform(df_all[feature_cols])
+                X_all_df = pd.DataFrame(X_all_filled, columns=feature_cols, index=df_all.index)
+                explanation = local_shap_or_surrogate(model_vs, X_all_df, feature_cols, row_idx)
+                print(f"Method: {explanation['method']}")
+                print(explanation['values'].head(15))
+            except Exception as e:
+                print(f"[WARN] Per-landing explainability failed: {e}")
+
+    # Save final dataset with anomaly labels
+    out_final = os.path.join(DATA_FOLDER, "processed_landings.csv")
+    df_all.to_csv(out_final, index=False)
+    print(f"[INFO] Pipeline Complete. Data saved to {out_final}")
+
+if __name__ == "__main__":
+    main()
