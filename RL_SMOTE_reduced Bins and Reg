@@ -1,0 +1,765 @@
+                            # KEEP AT TOP! FIX FOR THE LOCALE ERROR
+import os
+os.environ['LANG'] = 'en_US.UTF-8'
+os.environ['LC_ALL'] = 'en_US.UTF-8'
+
+#import libs
+from typing import Optional, Dict, Any, List, Tuple
+import glob
+import math
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold  # === NEW ===
+from sklearn.model_selection import cross_val_score  # === NEW ===
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestRegressor, IsolationForest
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+from sklearn.inspection import permutation_importance
+from sklearn.neighbors import NearestNeighbors
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import KBinsDiscretizer
+
+# SMOTE classifiers
+SMOTE_AVAILABLE = True
+try:
+    from imblearn.over_sampling import SMOTE
+    from imblearn.under_sampling import RandomUnderSampler  # === NEW ===
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+except Exception:
+    SMOTE_AVAILABLE = False
+
+warnings.filterwarnings("ignore", category=UserWarning)
+pd.set_option("display.width", 200)
+pd.set_option("display.max_columns", 200)
+
+                #CONFIG and scenario defination!
+DATA_FOLDER = "/Users/dinahang/Desktop/AAE25_FYP Subject_DATA/QAR_DATA"
+
+SCENARIO_KEYWORDS = ['vcrosswind', 'clear', 'lowvis_day', 'lowvis_night', 'crosswind']
+
+RUNWAY_TRUE_HEADING_DEG = 71.0  
+RUNWAY_ELEVATION_FT = 28.0
+QNH_HPA = 1022.0
+HPA_TO_FEET = 27.0
+
+N_SECONDS_BEFORE_TD = 15.0
+FALLBACK_DT_SECONDS = 1.0
+HARD_LANDING_FPM_THRESHOLD = -400.0
+
+CTRL_MAX_ABS = 16383.0
+
+                #Keep perm importance but small--only for VS
+DO_PERM_IMPORTANCE = True
+PERM_N_REPEATS = 3   # lower = faster
+
+#Config SMOTE settings!!
+USE_SMOTE_CLASSIFIER = True                # hard-landing classifier 
+USE_SMOTE_REGRESSION = True                # VS/G regressors with rare-target oversampling via bins
+
+SMOTE_SAMPLING_STRATEGY = "auto"              # minority / majority after SMOTE (classification)
+UNDER_SAMPLING_STRATEGY_CLS = 2/3          # minority / majority after undersampling (classification)
+                                           # ≈ majority = 1.5 * minority
+#####
+########
+##########Change this if kernell keep crashing !!#######
+SMOTE_BINS = 4                             # bins for regression workaround
+SMOTE_REG_STRATEGY = 0.8                   # minority / majority after SMOTE (regression bins)
+SMOTE_REG_UNDER_STRATEGY = None             # per-bin undersampling target (None/1.0 ~ balance bins)
+#############
+
+##csv file candidates! 
+THROTTLE_CANDIDATES = [
+    "throttle", "throttleCmd", "throttleLever", "thrLever", "thr", "thrustLevers",
+    "throttle1", "throttle2", "thrLever1", "thrLever2"
+]
+AOA_CANDIDATES = ["angleOfAttackAOA", "aoa", "angleOfAttack", "alpha"]
+BARO_ALT_CANDIDATES = ["alt_baro", "altBaro", "baroAlt", "alt_baro_feet", "alt_baro_ft", "pressureAlt", "pressAlt"]
+BANK_CANDIDATES = ["bank", "bank_raw", "bankDeg", "roll", "rollDeg", "roll_raw"]
+PITCH_CANDIDATES = ["pit", "pitch", "pitchDeg", "pitch_raw"]
+
+#UTILITIES:
+def list_raw_csvs(folder: str) -> List[str]:
+    """Return only candidate raw QAR landing CSVs; ignore pipeline outputs."""
+    all_csvs = glob.glob(os.path.join(folder, "*.csv"))
+    EXCLUDE = ["processed_landings", "scenario_metrics", "landing_ml_dataset", "with_models", "dataset", "models"]
+    return [f for f in all_csvs if not any(s in os.path.basename(f).lower() for s in EXCLUDE)]
+
+def scenario_from_name(fname: str, keywords: List[str]) -> str:
+    name = fname.lower()
+    for k in keywords:
+        if k in name:
+            return k
+    return "unclassified_scenario"
+
+def parse_timestamp_col(df: pd.DataFrame) -> pd.Series:
+    # Case 1: realWorldTime exists
+    if 'realWorldTime' in df.columns:
+        ts = pd.to_datetime(df['realWorldTime'], format="%Y%m%d_%H%M%S", errors="coerce")
+        if ts.notna().any():
+            return ts
+
+    # Case 2: standard Z columns exist
+    needed = {'hourZ', 'minZ', 'secZ', 'dayZ', 'monthZ', 'yearZ'}
+    if needed.issubset(df.columns):
+        return pd.to_datetime(
+            df[['yearZ', 'monthZ', 'dayZ', 'hourZ', 'minZ', 'secZ']].rename(
+                columns={
+                    'yearZ': 'year',
+                    'monthZ': 'month',
+                    'dayZ': 'day',
+                    'hourZ': 'hour',
+                    'minZ': 'minute',
+                    'secZ': 'second'
+                }
+            ),
+            errors="coerce"
+        )
+
+    # Case 3: no valid timestamps found
+    return pd.Series(pd.NaT, index=df.index)
+
+def wrap_deg_to_180(x: float) -> float:
+    return (x + 180.0) % 360.0 - 180.0
+
+def wind_components_true(wind_spd_kt: float, wind_dir_true_deg_from: float, ref_bearing_true_deg: float) -> Tuple[float, float]:
+    if pd.isna(wind_spd_kt) or pd.isna(wind_dir_true_deg_from):
+        return (np.nan, np.nan)
+    rel = math.radians(wrap_deg_to_180(wind_dir_true_deg_from - ref_bearing_true_deg))
+    head = wind_spd_kt * math.cos(rel)
+    cross = wind_spd_kt * math.sin(rel)
+    return head, cross
+
+def coerce_numeric_cols(df: pd.DataFrame, exclude: List[str] = None) -> pd.DataFrame:
+    exclude = set(exclude or [])
+    for c in df.columns:
+        if c not in exclude:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df
+
+def choose_first_present(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def detect_throttle_cols(df: pd.DataFrame) -> List[str]:
+    found = []
+    for col in THROTTLE_CANDIDATES:
+        if col in df.columns:
+            found.append(col)
+    for c in df.columns:
+        if any(s in c.lower() for s in ["thr", "throttle"]) and c not in found:
+            found.append(c)
+    return found
+
+def is_bank_raw_series(series: pd.Series) -> bool:
+    if series.dropna().empty:
+        return False
+    max_abs = series.abs().max()
+    if max_abs > 180.0:
+        return True
+    if pd.api.types.is_integer_dtype(series.dropna()):
+        return True
+    return False
+
+def apply_qar_conventions(df: pd.DataFrame) -> pd.DataFrame:
+    # Controls
+    if 'aileronIndicator' in df.columns:
+        df['aileron_norm'] = df['aileronIndicator'] / CTRL_MAX_ABS
+    if 'elevatorIndicator' in df.columns:
+        df['elevator_norm'] = df['elevatorIndicator'] / CTRL_MAX_ABS
+    if 'rudderIndicator' in df.columns:
+        df['rudder_norm'] = df['rudderIndicator'] / CTRL_MAX_ABS
+
+    # IAS
+    if 'ias' in df.columns:
+        df['ias'] = pd.to_numeric(df['ias'], errors='coerce')
+
+    # Bank
+    bank_col = choose_first_present(df, BANK_CANDIDATES)
+    if bank_col:
+        s = pd.to_numeric(df[bank_col], errors='coerce')
+        df['bank_deg'] = s * (360.0 / (65536.0 ** 2)) if is_bank_raw_series(s) else s.astype(float)
+    else:
+        df['bank_deg'] = np.nan
+
+    # Pitch
+    pitch_col = choose_first_present(df, PITCH_CANDIDATES)
+    if pitch_col:
+        df['pitch_deg'] = -pd.to_numeric(df[pitch_col], errors='coerce') if pitch_col == "pit" else pd.to_numeric(df[pitch_col], errors='coerce')
+    else:
+        df['pitch_deg'] = np.nan
+
+    # AoA
+    aoa_col = choose_first_present(df, AOA_CANDIDATES)
+    df['aoa_deg'] = pd.to_numeric(df[aoa_col], errors='coerce') if aoa_col else np.nan
+
+    return df
+
+def estimate_dt_seconds(ts: pd.Series) -> float:
+    if ts.isna().all():
+        return FALLBACK_DT_SECONDS
+    diffs = ts.diff().dt.total_seconds()
+    med = np.nanmedian(diffs)
+    return float(med) if not (np.isnan(med) or med <= 0) else FALLBACK_DT_SECONDS
+
+def construct_alt_agl_fallback(df: pd.DataFrame, td_idx: Optional[int] = None) -> pd.Series:
+    if 'alt_radio' in df.columns and df['alt_radio'].notna().sum() > 0:
+        alt_agl = pd.to_numeric(df['alt_radio'], errors='coerce')
+    else:
+        baro_col = choose_first_present(df, BARO_ALT_CANDIDATES)
+        if baro_col:
+            baro = pd.to_numeric(df[baro_col], errors='coerce').copy()
+            qnh_correction_ft = (QNH_HPA - 1013.25) * HPA_TO_FEET
+            alt_msl = baro - qnh_correction_ft
+            alt_agl = alt_msl - RUNWAY_ELEVATION_FT
+        else:
+            return pd.Series(np.nan, index=df.index)
+
+    if td_idx is not None and 0 <= td_idx < len(alt_agl) and pd.notna(alt_agl.iloc[td_idx]):
+        return alt_agl - alt_agl.iloc[td_idx]
+    return alt_agl - alt_agl.min(skipna=True)
+
+def find_touchdown_index(df: pd.DataFrame, alt_agl: pd.Series) -> Optional[int]:
+    if 'onGround' in df.columns:
+        og = pd.to_numeric(df['onGround'], errors='coerce').fillna(0).astype(int)
+        trans = np.where((og.shift(1, fill_value=0) == 0) & (og == 1))[0]
+        if len(trans) > 0:
+            return int(trans[0])
+    if alt_agl.notna().sum() > 0 and alt_agl.min() < 10:
+        return int(alt_agl.idxmin())
+    return None
+
+def slope_over_window(x: pd.Series, y: pd.Series) -> float:
+    try:
+        xv = x.values.astype(float)
+        yv = y.values.astype(float)
+        if len(xv) < 2 or np.any(np.isnan(xv)) or np.any(np.isnan(yv)):
+            return np.nan
+        A = np.vstack([xv, np.ones_like(xv)]).T
+        m, _ = np.linalg.lstsq(A, yv, rcond=None)[0]
+        return float(m)
+    except Exception:
+        return np.nan
+
+#CSV PROCESSING=
+def process_file(fpath: str) -> Optional[Dict[str, Any]]:
+    try:
+        df = pd.read_csv(fpath, low_memory=False)
+    except Exception as e:
+        print(f"[WARN] Skipping {fpath}: {e}")
+        return None
+
+    fname = os.path.basename(fpath)
+    scenario = scenario_from_name(fname, SCENARIO_KEYWORDS)
+    df = df.drop_duplicates().reset_index(drop=True)
+
+    required_any = ['onGround', 'vs', 'accVERTy', 'ias']
+    if not all(c in df.columns for c in required_any):
+        print(f"[WARN] Missing required columns in {fname}")
+        return None
+
+    df = coerce_numeric_cols(df, exclude=['realWorldTime', 'scenario'])
+    df['timestamp'] = parse_timestamp_col(df)
+    df = apply_qar_conventions(df)
+
+    # wind
+    if 'windSpd' in df.columns and 'windDir' in df.columns:
+        pairs = df.apply(
+            lambda r: wind_components_true(
+                r.get('windSpd', np.nan),
+                r.get('windDir', np.nan),
+                RUNWAY_TRUE_HEADING_DEG
+            ),
+            axis=1
+        )
+        df['headwind_kt'] = [p[0] for p in pairs]
+        df['crosswind_kt'] = [p[1] for p in pairs]
+
+    alt_agl_initial = construct_alt_agl_fallback(df, td_idx=None)
+    td_idx = find_touchdown_index(df, alt_agl_initial)
+    if td_idx is None:
+        td_idx = find_touchdown_index(df, alt_agl_initial - alt_agl_initial.min(skipna=True))
+    if td_idx is None:
+        print(f"[WARN] Could not determine touchdown in {fname}")
+        return None
+
+    alt_agl = construct_alt_agl_fallback(df, td_idx=td_idx)
+    df['alt_agl_ft'] = alt_agl
+
+    dt = estimate_dt_seconds(df['timestamp'])
+    rows_pre = int(max(1, round(N_SECONDS_BEFORE_TD / dt)))
+    idx_pre = max(0, td_idx - rows_pre)
+    seg = df.iloc[idx_pre: td_idx + 1].copy()
+
+    if df['timestamp'].isna().all():
+        df['_tsec'] = np.arange(len(df)) * dt
+        seg['_tsec'] = np.arange(len(seg)) * dt
+    else:
+        t0 = df['timestamp'].iloc[idx_pre]
+        df['_tsec'] = (df['timestamp'] - df['timestamp'].iloc[0]).dt.total_seconds()
+        seg['_tsec'] = (seg['timestamp'] - t0).dt.total_seconds()
+
+    vs_td = df.at[td_idx, 'vs']
+    g_td = df.at[td_idx, 'accVERTy']
+
+    feats_at_td = {
+        'ias_td': df.at[td_idx, 'ias'],
+        'bank_td_deg': df.at[td_idx, 'bank_deg'] if 'bank_deg' in df.columns else np.nan,
+        'pitch_td_deg': df.at[td_idx, 'pitch_deg'] if 'pitch_deg' in df.columns else np.nan,
+        'aoa_td_deg': df.at[td_idx, 'aoa_deg'] if 'aoa_deg' in df.columns else np.nan,
+        'alt_td_agl_ft': df.at[td_idx, 'alt_agl_ft'],
+        'aileron_td': df.at[td_idx, 'aileron_norm'] if 'aileron_norm' in df.columns else np.nan,
+        'elevator_td': df.at[td_idx, 'elevator_norm'] if 'elevator_norm' in df.columns else np.nan,
+        'rudder_td': df.at[td_idx, 'rudder_norm'] if 'rudder_norm' in df.columns else np.nan,
+        'headwind_td': df.at[td_idx, 'headwind_kt'] if 'headwind_kt' in df.columns else np.nan,
+        'crosswind_td': df.at[td_idx, 'crosswind_kt'] if 'crosswind_kt' in df.columns else np.nan,
+    }
+
+    def get_seg(name):
+        return seg[name] if name in seg.columns else pd.Series(np.nan, index=seg.index)
+
+    seg_vs = get_seg('vs')
+    seg_ias = get_seg('ias')
+    seg_bank = get_seg('bank_deg')
+    seg_pitch = get_seg('pitch_deg')
+    seg_aoa = get_seg('aoa_deg')
+    seg_alt = get_seg('alt_agl_ft')
+    seg_ail = get_seg('aileron_norm')
+    seg_ele = get_seg('elevator_norm')
+    seg_rud = get_seg('rudder_norm')
+    seg_t = seg['_tsec']
+
+    throttle_cols = detect_throttle_cols(seg)
+    seg['throttle_mean'] = seg[throttle_cols].mean(axis=1) if throttle_cols else np.nan
+
+    def agg_stats(s: pd.Series, prefix: str) -> Dict[str, float]:
+        return {
+            f'{prefix}_mean': s.mean(skipna=True),
+            f'{prefix}_std': s.std(skipna=True),
+            f'{prefix}_max': s.max(skipna=True),
+            f'{prefix}_min': s.min(skipna=True),
+            f'{prefix}_p10': s.quantile(0.10) if s.notna().sum() else np.nan,
+            f'{prefix}_p90': s.quantile(0.90) if s.notna().sum() else np.nan,
+            f'{prefix}_range': (s.max(skipna=True) - s.min(skipna=True)) if s.notna().sum() else np.nan
+        }
+
+    features = {
+        'file': fname,
+        'scenario': scenario,
+        'vs_td_target': vs_td,
+        'g_td_target': g_td,
+        **feats_at_td,
+        # Slopes (keep a few)
+        'slope_vs': slope_over_window(seg_t, seg_vs),
+        'slope_ias': slope_over_window(seg_t, seg_ias),
+        'slope_alt': slope_over_window(seg_t, seg_alt),
+        'slope_bank': slope_over_window(seg_t, seg_bank),
+        'slope_pitch': slope_over_window(seg_t, seg_pitch),
+        # Core stability aggregates
+        **agg_stats(seg_vs, 'vs_approach'),
+        **agg_stats(seg_ias, 'ias_approach'),
+        **agg_stats(seg_bank.abs(), 'bankAbs_approach'),
+        **agg_stats(seg_pitch, 'pitch_approach'),
+        **agg_stats(seg_aoa, 'aoa_approach'),
+        **agg_stats(seg_alt, 'alt_agl_approach'),
+        **agg_stats(seg_ail, 'aileron_approach'),
+        **agg_stats(seg_ele, 'elevator_approach'),
+        **agg_stats(seg_rud, 'rudder_approach'),
+        **agg_stats(seg['throttle_mean'], 'throttle_approach')
+    }
+
+    steps_5s = int(round(5.0 / max(estimate_dt_seconds(df['timestamp']), 1e-6)))
+    idx_5s = max(0, td_idx - steps_5s)
+    features['alt_rate_final_5s'] = (
+        (df.at[td_idx, 'alt_agl_ft'] - df.at[idx_5s, 'alt_agl_ft']) / 5.0
+        if 'alt_agl_ft' in df.columns else np.nan
+    )
+
+    features['hard_landing_flag'] = 1 if (pd.notna(vs_td) and vs_td <= HARD_LANDING_FPM_THRESHOLD) else 0
+    return features
+
+# ===== SUMMARY / EXPLAINABILITY =====
+def global_permutation_report(model, X_test, y_test, feat_names, title: str, n_repeats: int = 3):
+    """Small, fast permutation importance — VS only by default."""
+    result = permutation_importance(model, X_test, y_test, n_repeats=n_repeats, random_state=42, n_jobs=-1)
+    importances = pd.Series(result.importances_mean, index=feat_names).sort_values()
+    top = importances.tail(10)
+    plt.figure(figsize=(9, 5))
+    top.plot(kind='barh')
+    plt.title(title + " (Top 10)")
+    plt.tight_layout()
+    plt.show()
+    return importances
+
+def local_surrogate(model, X_all: pd.DataFrame, feat_names: List[str], row_idx: int):
+    """Lean local explanation via k-NN + linear regression (no SHAP to keep it light)."""
+    x_row = X_all.iloc[[row_idx]]
+    k = min(50, max(10, int(0.2 * len(X_all))))
+    nbrs = NearestNeighbors(n_neighbors=k, metric='euclidean')
+    nbrs.fit(X_all.values)
+    _, indices = nbrs.kneighbors(x_row.values)
+    X_local = X_all.iloc[indices[0]]
+    y_local = model.predict(X_local.values)
+    lin = LinearRegression()
+    lin.fit(X_local.values, y_local)
+    coefs = pd.Series(lin.coef_, index=feat_names).sort_values(key=np.abs, ascending=False)
+    coefs.head(15).plot(kind='barh', figsize=(8, 6), color='tab:purple')
+    plt.title("Top Local Surrogate Coefficients")
+    plt.tight_layout()
+    plt.show()
+    return {"method": "Local linear surrogate (k-NN)", "values": coefs}
+
+# SMOTE for regression (binning + optional undersampling_because kernell deps dying_need more RAM f)
+def smote_regression_resample(
+    X_df_num: pd.DataFrame,
+    y_cont: pd.Series,
+    n_bins: int = 5,
+    smote_strategy: float = 0.8,
+    under_strategy: Optional[float] = None
+):
+    """
+   # Discretize continuous y into n_bins by quantile.
+   ##  Apply SMOTE on (X, y_bin) to upsample rare bins (extremes).
+   ### Optionally RandomUnderSampler to reduce over-represented bins.
+   ####) Return X_res, y_res using the bin-median y for synthetic points.
+    """
+    if not SMOTE_AVAILABLE:
+        return None, None, None
+
+    imp = SimpleImputer(strategy='median')
+    X_imp = imp.fit_transform(X_df_num)
+
+    kbd = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='quantile')
+    y_bin = kbd.fit_transform(y_cont.to_numpy().reshape(-1, 1)).ravel().astype(int)
+
+    # SMOTE step
+    sm = SMOTE(sampling_strategy=smote_strategy, random_state=42)
+    X_sm, y_bin_sm = sm.fit_resample(X_imp, y_bin)
+
+    # Optional undersampling step
+    if under_strategy is not None:
+        under = RandomUnderSampler(sampling_strategy=under_strategy, random_state=42)
+        X_res, y_bin_res = under.fit_resample(X_sm, y_bin_sm)
+    else:
+        X_res, y_bin_res = X_sm, y_bin_sm
+
+    # Map each bin to the median of original y
+    bin_to_y = pd.Series(y_cont).groupby(y_bin).median()
+    y_res = pd.Series([bin_to_y[b] for b in y_bin_res], dtype=float).values
+
+    return X_res, y_res, imp
+
+#  MAIN 
+def main():
+    files = list_raw_csvs(DATA_FOLDER)
+    if not files:
+        print(f"No CSV files found in {DATA_FOLDER}") #failure safe_csv file
+        return
+
+    records = [process_file(f) for f in files]
+    df_all = pd.DataFrame([r for r in records if r is not None])
+
+    if df_all.empty:
+        print("No valid landing data found.")
+        return
+
+    out_raw = os.path.join(DATA_FOLDER, "processed_landings_raw.csv")
+    df_all.to_csv(out_raw, index=False)
+    print(f"[INFO] Saved raw engineered features to {out_raw}")
+
+    # Build feature matrix scenario one-hot encoding 
+    target_vs = 'vs_td_target'
+    target_g = 'g_td_target'
+    base_non_features = ['file', 'scenario', target_vs, target_g, 'hard_landing_flag']
+
+    base_feature_cols = [c for c in df_all.columns if c not in base_non_features]
+    scen_dummies = pd.get_dummies(df_all['scenario'], prefix='scen')
+    X_df = pd.concat([df_all[base_feature_cols], scen_dummies], axis=1)  # one-hot added here
+    feature_cols = list(X_df.columns)
+
+    X = X_df.copy()
+    y_vs = df_all[target_vs].astype(float).copy()
+    y_g  = df_all[target_g].astype(float).copy()
+    scen_series = df_all['scenario']
+
+    imputer = SimpleImputer(strategy='median')
+    X_filled = imputer.fit_transform(X)
+
+    # Regression_ !! GLOBAL VS MODEL 
+    X_train, X_test, y_train_vs, y_test_vs, scen_tr, scen_te = train_test_split(
+        X_filled, y_vs, scen_series, test_size=0.2, random_state=42, stratify=scen_series
+    )
+    model_vs = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42, n_jobs=-1)
+    model_vs.fit(X_train, y_train_vs)
+    preds_vs = model_vs.predict(X_test)
+
+    print("\n[GLOBAL VS MODEL]")
+    print(f"R^2:  {r2_score(y_test_vs, preds_vs):.4f}")
+    print(f"MAE:  {mean_absolute_error(y_test_vs, preds_vs):.2f} fpm")
+    print(f"RMSE: {mean_squared_error(y_test_vs, preds_vs, squared=False):.2f} fpm")
+
+    # Regression_ !! GLOBAL G MODEL 
+    X_train_g, X_test_g, y_train_g, y_test_g, scen_tr_g, scen_te_g = train_test_split(
+        X_filled, y_g, scen_series, test_size=0.2, random_state=42, stratify=scen_series
+    )
+    model_g = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42, n_jobs=-1)
+    model_g.fit(X_train_g, y_train_g)
+    preds_g = model_g.predict(X_test_g)
+
+    print("\n[GLOBAL G MODEL]")
+    print(f"R^2:  {r2_score(y_test_g, preds_g):.4f}")
+    print(f"MAE:  {mean_absolute_error(y_test_g, preds_g):.4f} (channel units)")
+    print(f"RMSE: {mean_squared_error(y_test_g, preds_g, squared=False):.4f} (channel units)")
+
+    #  Anomaly Detection
+    iso = IsolationForest(contamination=0.10, random_state=42)
+    df_all['anomaly_label'] = iso.fit_predict(X_filled)
+
+    # Permutation Importance (VS only, fast) 
+    if DO_PERM_IMPORTANCE:
+        try:
+            global_permutation_report(
+                model_vs,
+                X_test,
+                y_test_vs,
+                feature_cols,
+                "Global Permutation Importance (VS)",
+                n_repeats=PERM_N_REPEATS
+            )
+        except Exception as e:
+            print(f"[WARN] Permutation importance skipped: {e}")
+
+    #Per-scenario evaluation (NO retraining) 
+    scenario_metrics = []
+    for scen_name, df_s in df_all.groupby('scenario'):
+        if len(df_s) < 5:
+            continue
+        Xs = X_df.loc[df_s.index]
+        Xs_filled = imputer.transform(Xs)
+        ys_vs = df_s[target_vs].values
+        ys_g  = df_s[target_g].values
+
+        p_vs = model_vs.predict(Xs_filled)
+        p_g  = model_g.predict(Xs_filled)
+
+        scen_row = {
+            'scenario': scen_name,
+            'n': len(df_s),
+            'VS_R2': r2_score(ys_vs, p_vs) if len(np.unique(ys_vs)) > 1 else np.nan,
+            'VS_MAE_fpm': mean_absolute_error(ys_vs, p_vs),
+            'VS_RMSE_fpm': mean_squared_error(ys_vs, p_vs, squared=False),
+            'G_R2': r2_score(ys_g, p_g) if len(np.unique(ys_g)) > 1 else np.nan,
+            'G_MAE_g': mean_absolute_error(ys_g, p_g),
+            'G_RMSE_g': mean_squared_error(ys_g, p_g, squared=False),
+        }
+        scenario_metrics.append(scen_row)
+
+    if scenario_metrics:
+        df_scen = pd.DataFrame(scenario_metrics)
+        out_scen = os.path.join(DATA_FOLDER, "scenario_metrics.csv")
+        df_scen.to_csv(out_scen, index=False)
+        print(f"[INFO] Per-scenario metrics saved to {out_scen}")
+        print(df_scen.sort_values('scenario'))
+
+    #  Practical EDA #Visializaiton plott output
+    try:
+        # Pred vs Actual (Global)
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        ax[0].scatter(y_test_vs, preds_vs, alpha=0.6, edgecolor='k')
+        lims = [min(y_test_vs.min(), preds_vs.min()), max(y_test_vs.max(), preds_vs.max())]
+        ax[0].plot(lims, lims, 'r--')
+        ax[0].set_xlim(lims); ax[0].set_ylim(lims)
+        ax[0].set_title("VS: Predicted vs Actual")
+        ax[0].set_xlabel("Actual VS (fpm)"); ax[0].set_ylabel("Predicted VS (fpm)")
+
+        ax[1].scatter(y_test_g, preds_g, alpha=0.6, edgecolor='k', color='tab:green')
+        lims = [min(y_test_g.min(), preds_g.min()), max(y_test_g.max(), preds_g.max())]
+        ax[1].plot(lims, lims, 'r--')
+        ax[1].set_xlim(lims); ax[1].set_ylim(lims)
+        ax[1].set_title("G: Predicted vs Actual")
+        ax[1].set_xlabel("Actual G (channel units)"); ax[1].set_ylabel("Predicted G")
+        plt.tight_layout(); plt.show()
+
+        # Residual distributions
+        err_vs = preds_vs - y_test_vs.values
+        err_g  = preds_g - y_test_g.values
+        fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+        sns.histplot(err_vs, bins=30, kde=True, ax=ax[0], color='tab:blue')
+        ax[0].set_title("VS Residuals (Pred - Actual) [fpm]")
+        sns.histplot(err_g, bins=30, kde=True, ax=ax[1], color='tab:orange')
+        ax[1].set_title("G Residuals (Pred - Actual)")
+        plt.tight_layout(); plt.show()
+
+        # Scenario boxplots
+        if 'scenario' in df_all.columns:
+            fig, ax = plt.subplots(1, 2, figsize=(14, 5))
+            sns.boxplot(data=df_all, x='scenario', y='vs_td_target', ax=ax[0])
+            ax[0].set_title("VS by Scenario (Touchdown fpm)")
+            ax[0].tick_params(axis='x', rotation=30)
+            sns.boxplot(data=df_all, x='scenario', y='g_td_target', ax=ax[1], color='lightgreen')
+            ax[1].set_title("G by Scenario (Touchdown)")
+            ax[1].tick_params(axis='x', rotation=30)
+            plt.tight_layout(); plt.show()
+
+        # Key relationships
+        def safe_scatter(xname, y, title, color='tab:blue'):
+            if xname in df_all.columns:
+                plt.figure(figsize=(5.5, 4.5))
+                plt.scatter(df_all[xname], df_all[y], alpha=0.5, edgecolor='k', color=color)
+                plt.xlabel(xname); plt.ylabel(y); plt.title(title)
+                plt.tight_layout(); plt.show()
+
+        safe_scatter('ias_td', 'vs_td_target', 'VS vs IAS at TD')
+        safe_scatter('headwind_td', 'vs_td_target', 'VS vs Headwind at TD')
+        safe_scatter('bank_td_deg', 'g_td_target', 'G vs |Bank| at TD', color='tab:red')
+
+    except Exception as e:
+        print(f"[WARN] EDA plotting skipped due to: {e}")
+
+    #  Optional per-landing explanation (k-NN surrogate only) 
+    EXPLAIN_LANDING_FILE = None  # set a filename to explain
+    if EXPLAIN_LANDING_FILE is not None:
+        mask = df_all['file'].str.lower() == EXPLAIN_LANDING_FILE.lower()
+        if not mask.any():
+            print(f"[WARN] Landing file '{EXPLAIN_LANDING_FILE}' not found in processed data.")
+        else:
+            row_idx = mask.idxmax()
+            X_all_filled = SimpleImputer(strategy='median').fit_transform(X_df)
+            X_all_df = pd.DataFrame(X_all_filled, columns=feature_cols, index=df_all.index)
+            explanation = local_surrogate(model_vs, X_all_df, feature_cols, row_idx)
+            print(f"Method: {explanation['method']}")
+            print(explanation['values'].head(15))
+
+    #  HARD-LANDING CLASSIFIER WITH SMOTE + UNDERSAMPLING 
+    if SMOTE_AVAILABLE and USE_SMOTE_CLASSIFIER:
+        print("\n[HARD-LANDING CLASSIFIER WITH SMOTE + RANDOM UNDERSAMPLING]")
+        y_cls = df_all['hard_landing_flag'].astype(int).values
+
+        # Basic split for inspection
+        X_train_c, X_test_c, y_train_c, y_test_c = train_test_split(
+            X_df.values, y_cls, test_size=0.2, random_state=42, stratify=y_cls
+        )
+
+        clf_pipe = ImbPipeline(steps=[
+            ('imputer', SimpleImputer(strategy='median')),
+            ('smote', SMOTE(
+                sampling_strategy=SMOTE_SAMPLING_STRATEGY,
+                random_state=42,
+                k_neighbors=3          # small k for small minority counts
+            )),
+            ('under', RandomUnderSampler(
+                sampling_strategy=UNDER_SAMPLING_STRATEGY_CLS,
+                random_state=42
+            )),
+            ('rf', RandomForestClassifier(
+                n_estimators=300,
+                max_depth=12,
+                random_state=42,
+                n_jobs=-1
+            ))
+        ])
+
+        from collections import Counter
+        print("Class balance (overall):", Counter(y_cls))
+        print("Class balance (train) before SMOTE:", Counter(y_train_c))
+
+        # Fit on train split
+        clf_pipe.fit(X_train_c, y_train_c)
+        pred_c = clf_pipe.predict(X_test_c)
+        try:
+            proba_c = clf_pipe.predict_proba(X_test_c)[:, 1]
+        except Exception:
+            proba_c = None
+
+        print("Confusion matrix (hold-out):\n", confusion_matrix(y_test_c, pred_c))
+        print("\nClassification report (hold-out):\n", classification_report(y_test_c, pred_c, digits=3))
+        if proba_c is not None:
+            try:
+                print("ROC-AUC (hold-out): %.3f" % roc_auc_score(y_test_c, proba_c))
+            except Exception:
+                pass
+
+        #  make NEW: 5-fold CV to get more stable estimate 
+        print("\n[5-FOLD CV PERFORMANCE (SMOTE + UNDERSAMPLING)]")
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        f1_scores = cross_val_score(clf_pipe, X_df.values, y_cls, cv=cv, scoring='f1')
+        roc_scores = cross_val_score(clf_pipe, X_df.values, y_cls, cv=cv, scoring='roc_auc')
+
+        print("F1 scores (per fold):", np.round(f1_scores, 3))
+        print("Mean F1:", f1_scores.mean())
+        print("ROC-AUC (per fold):", np.round(roc_scores, 3))
+        print("Mean ROC-AUC:", roc_scores.mean())
+
+    elif USE_SMOTE_CLASSIFIER and not SMOTE_AVAILABLE:
+        print("[INFO] imbalanced-learn not installed; skipping SMOTE classifier. Run: pip install imbalanced-learn")
+
+    #  SMOTE-FOR-REGRESSION (optional, with undersampling of bins) 
+    if SMOTE_AVAILABLE and USE_SMOTE_REGRESSION:
+        print("\n[VS REGRESSION WITH RARE-TARGET OVERSAMPLING (SMOTE on bins + optional undersampling)]")
+        X_vs_sm, y_vs_sm, imp_vs = smote_regression_resample(
+            X_df,
+            df_all['vs_td_target'],
+            n_bins=SMOTE_BINS,
+            smote_strategy=SMOTE_REG_STRATEGY,
+            under_strategy=SMOTE_REG_UNDER_STRATEGY
+        )
+        if X_vs_sm is not None:
+            rf_vs_sm = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42, n_jobs=-1)
+            rf_vs_sm.fit(X_vs_sm, y_vs_sm)
+
+            # Evaluate on an untouched split for fairness
+            X_train_eval, X_test_eval, y_train_eval, y_test_eval, scen_tr2, scen_te2 = train_test_split(
+                X_df, df_all['vs_td_target'].values, df_all['scenario'], test_size=0.2,
+                random_state=7, stratify=df_all['scenario']
+            )
+            X_test_imp = imp_vs.transform(X_test_eval)
+            preds_vs_sm = rf_vs_sm.predict(X_test_imp)
+            print(f"R^2:  {r2_score(y_test_eval, preds_vs_sm):.4f}")
+            print(f"MAE:  {mean_absolute_error(y_test_eval, preds_vs_sm):.2f} fpm")
+            print(f"RMSE: {mean_squared_error(y_test_eval, preds_vs_sm, squared=False):.2f} fpm")
+
+        print("\n[G REGRESSION WITH RARE-TARGET OVERSAMPLING (SMOTE on bins + optional undersampling)]")
+        X_g_sm, y_g_sm, imp_g = smote_regression_resample(
+            X_df,
+            df_all['g_td_target'],
+            n_bins=SMOTE_BINS,
+            smote_strategy=SMOTE_REG_STRATEGY,
+            under_strategy=SMOTE_REG_UNDER_STRATEGY
+        )
+        if X_g_sm is not None:
+            rf_g_sm = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42, n_jobs=-1)
+            rf_g_sm.fit(X_g_sm, y_g_sm)
+
+            X_train_eval_g, X_test_eval_g, y_train_eval_g, y_test_eval_g, scen_tr3, scen_te3 = train_test_split(
+                X_df, df_all['g_td_target'].values, df_all['scenario'], test_size=0.2,
+                random_state=7, stratify=df_all['scenario']
+            )
+            X_test_imp_g = imp_g.transform(X_test_eval_g)
+            preds_g_sm = rf_g_sm.predict(X_test_imp_g)
+            print(f"R^2:  {r2_score(y_test_eval_g, preds_g_sm):.4f}")
+            print(f"MAE:  {mean_absolute_error(y_test_eval_g, preds_g_sm):.4f} (channel units)")
+            print(f"RMSE: {mean_squared_error(y_test_eval_g, preds_g_sm, squared=False):.4f} (channel units)")
+    elif USE_SMOTE_REGRESSION and not SMOTE_AVAILABLE:
+        print("[INFO] imbalanced-learn not installed; skipping SMOTE-for-regression. Run: pip install imbalanced-learn")
+
+    # out_final!
+    out_final = os.path.join(DATA_FOLDER, "processed_landings.csv")
+    X_out = X_df.copy()
+    X_out['vs_td_target'] = df_all['vs_td_target'].values
+    X_out['g_td_target']  = df_all['g_td_target'].values
+    X_out['hard_landing_flag'] = df_all['hard_landing_flag'].values
+    X_out['scenario'] = df_all['scenario'].values
+    X_out['file'] = df_all['file'].values
+    X_out.to_csv(out_final, index=False)
+    print(f"[INFO] Pipeline Complete. Data saved to {out_final}")
+
+if __name__ == "__main__":
+    main()
